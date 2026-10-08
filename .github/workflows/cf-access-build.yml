@@ -61,6 +61,29 @@ jobs:
             echo "done=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # ---------------------------------------------------------------- Tests
+      # Nothing is published unless the rebased code passes upstream's own suites.
+      - if: steps.skip.outputs.done != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            api/package-lock.json
+      - name: Frontend tests
+        if: steps.skip.outputs.done != 'true'
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+      - name: API tests
+        if: steps.skip.outputs.done != 'true'
+        working-directory: api
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
       # ---------------------------------------------------------------- API image
       - if: steps.skip.outputs.done != 'true'
         uses: docker/setup-buildx-action@v3
@@ -89,12 +112,6 @@ jobs:
 
       # ---------------------------------------------------------------- APK
       - if: steps.skip.outputs.done != 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - if: steps.skip.outputs.done != 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -102,38 +119,46 @@ jobs:
       - name: Signing key
         if: steps.skip.outputs.done != 'true'
         env:
-          KS: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          KS: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
         run: |
-          # The same key as the APK already on the phone, so each build installs over it.
-          if [ -z "$KS" ]; then echo "::error::Secret DEBUG_KEYSTORE_B64 is not set"; exit 1; fi
-          echo "$KS" | base64 -d > "$RUNNER_TEMP/sign.keystore"
-          keytool -list -v -keystore "$RUNNER_TEMP/sign.keystore" -storepass android | grep -m1 SHA256
-      - name: Version
+          if [ -z "$KS" ] || [ -z "$KS_PASS" ]; then
+            echo "::error::Secrets RELEASE_KEYSTORE_B64 and RELEASE_KEYSTORE_PASSWORD must both be set"; exit 1
+          fi
+          echo "$KS" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          keytool -list -v -keystore "$RUNNER_TEMP/release.keystore" -storepass "$KS_PASS" | grep -m1 SHA256
+      - name: App ID, name and version
         if: steps.skip.outputs.done != 'true'
         run: |
           G=frontend/android/app/build.gradle
+          # Its own app: installs beside the official openGym instead of clashing with it.
+          sed -i 's/applicationId "ch.duartesantos.opengym"/applicationId "ch.duartesantos.opengym.cf"/' "$G"
+          sed -i -E 's#(<string name="(app_name|title_activity_main)">)openGym(</string>)#\1openGym CF\3#' \
+            frontend/android/app/src/main/res/values/strings.xml
           CODE=$(grep -oP 'versionCode \K[0-9]+' "$G")
           # Higher than the release it is built from, and rising on every run of that release.
           NEW=$(( CODE * 100 + GITHUB_RUN_NUMBER % 100 ))
           sed -i -E "s/versionCode [0-9]+/versionCode $NEW/; s/versionName \"[^\"]*\"/versionName \"${{ steps.src.outputs.ver }}\"/" "$G"
-          grep -E 'versionCode|versionName' "$G"
-      - name: Build the APK
+          grep -E 'applicationId|versionCode|versionName' "$G"
+          grep -E 'app_name|title_activity_main' frontend/android/app/src/main/res/values/strings.xml
+      - name: Build and sign the release APK
         if: steps.skip.outputs.done != 'true'
         working-directory: frontend
+        env:
+          KS_PASS: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
         run: |
-          npm ci --no-audit --no-fund
           npm run build:mobile
-          cd android && ./gradlew --no-daemon assembleDebug
-          # Signed again with the phone's key: Gradle on the runner signs with a key of its own
-          # making, and Android refuses an update signed with a different key.
-          OUT="$GITHUB_WORKSPACE/openGym-${{ steps.src.outputs.ver }}.apk"
+          cd android && ./gradlew --no-daemon assembleRelease
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$BT/apksigner" sign --ks "$RUNNER_TEMP/sign.keystore" --ks-key-alias androiddebugkey \
-            --ks-pass pass:android --key-pass pass:android --out "$OUT" app/build/outputs/apk/debug/app-debug.apk
-          WANT=$(keytool -list -v -keystore "$RUNNER_TEMP/sign.keystore" -storepass android | grep -m1 SHA256 | sed 's/.*SHA256: //; s/://g' | tr 'A-F' 'a-f')
+          OUT="$GITHUB_WORKSPACE/openGym-CF-${{ steps.src.outputs.ver }}.apk"
+          "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.keystore" --ks-key-alias opengym \
+            --ks-pass env:KS_PASS --key-pass env:KS_PASS --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          WANT=$(keytool -list -v -keystore "$RUNNER_TEMP/release.keystore" -storepass "$KS_PASS" | grep -m1 SHA256 | sed 's/.*SHA256: //; s/://g' | tr 'A-F' 'a-f')
           GOT=$("$BT/apksigner" verify --print-certs "$OUT" | grep -m1 'SHA-256' | sed 's/.*: //')
           echo "want $WANT"; echo "got  $GOT"
-          [ "$WANT" = "$GOT" ] || { echo "::error::APK is not signed with the phone's key"; exit 1; }
+          [ "$WANT" = "$GOT" ] || { echo "::error::APK is not signed with the release key"; exit 1; }
+          rm -f "$RUNNER_TEMP/release.keystore"
 
       # ---------------------------------------------------------------- Release
       - name: Publish the release
@@ -143,8 +168,8 @@ jobs:
         run: |
           REL="${{ steps.src.outputs.release }}"
           gh release delete "$REL" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$REL" "openGym-${{ steps.src.outputs.ver }}.apk" -R "$GITHUB_REPOSITORY" \
+          gh release create "$REL" "openGym-CF-${{ steps.src.outputs.ver }}.apk" -R "$GITHUB_REPOSITORY" \
             --target fork-ci --latest \
-            --title "openGym ${{ steps.src.outputs.ver }}" \
-            --notes "openGym ${{ steps.src.outputs.tag }} + Cloudflare Access (branch \`$BRANCH\`).
+            --title "openGym CF ${{ steps.src.outputs.ver }}" \
+            --notes "openGym ${{ steps.src.outputs.tag }} + Cloudflare Access (branch \`$BRANCH\`). Release build, app ID \`ch.duartesantos.opengym.cf\`.
           API image: \`${{ steps.img.outputs.name }}:cf-access\` (also \`:${{ steps.src.outputs.ver }}\`)."

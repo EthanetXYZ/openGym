@@ -11,8 +11,12 @@ branch on top, and publishes:
 - **API image**: `ghcr.io/ethanetxyz/opengym-api:cf-access`. Use it in place of
   `ghcr.io/duartesantos8/opengym-api:latest`; keep the official `opengym-web` image.
 
-Needs one secret, `DEBUG_KEYSTORE_B64`: the base64 of the keystore the installed APK was signed
-with, so every build installs over it.
+The APK is a release build, app ID `ch.duartesantos.opengym.cf` ("openGym CF"), so it installs
+beside the official app. Nothing is published unless upstream's frontend and API tests pass.
+
+Needs two secrets: `RELEASE_KEYSTORE_B64` (base64 of the signing keystore, alias `opengym`) and
+`RELEASE_KEYSTORE_PASSWORD`. Every build must be signed with that same key, or Android refuses
+the update.
 
 Once the PR is merged upstream, switch back to the official APK and images and disable this
 workflow.
