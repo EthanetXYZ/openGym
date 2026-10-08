@@ -1,0 +1,141 @@
+# Builds openGym's latest release with the Cloudflare Access change (PR #439) applied on top:
+#   - an APK, attached to a GitHub Release on this fork (Obtainium watches those)
+#   - the API image, pushed to ghcr.io/<owner>/opengym-api:cf-access (Unraid pulls it)
+# Runs daily and skips when that release + branch combination was already built.
+# Run it by hand from the Actions tab; tick "force" to rebuild anyway.
+name: Build openGym + Cloudflare Access
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this version was already built
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM: https://github.com/DuarteSantos8/openGym.git
+  BRANCH: feat/mobile-cloudflare-access
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Rebase onto the latest upstream release
+        id: src
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch -q upstream main --tags
+          TAG=$(git tag -l 'v*' --merged upstream/main | sort -V | tail -1)
+          FEAT=$(git rev-parse --short=7 HEAD)
+          # Replays only this branch's own commits onto the release tag. A conflict fails the
+          # run (GitHub emails you): rebase the branch by hand, then run this again.
+          git rebase --onto "$TAG" upstream/main
+          VER="${TAG#v}-cf.${FEAT}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "release=v$VER" >> "$GITHUB_OUTPUT"
+          echo "Building $VER"
+
+      - name: Skip if already built
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && gh release view "${{ steps.src.outputs.release }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${{ steps.src.outputs.release }} exists, nothing to do."
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------------------------------------------------------------- API image
+      - if: steps.skip.outputs.done != 'true'
+        uses: docker/setup-buildx-action@v3
+      - if: steps.skip.outputs.done != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image name
+        if: steps.skip.outputs.done != 'true'
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opengym-api" >> "$GITHUB_OUTPUT"
+      - name: Build and push the API image
+        if: steps.skip.outputs.done != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          target: default
+          platforms: linux/amd64
+          push: true
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ steps.img.outputs.name }}:cf-access
+            ${{ steps.img.outputs.name }}:${{ steps.src.outputs.ver }}
+
+      # ---------------------------------------------------------------- APK
+      - if: steps.skip.outputs.done != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - if: steps.skip.outputs.done != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Signing key
+        if: steps.skip.outputs.done != 'true'
+        env:
+          KS: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          # The same key as the APK already on the phone, so each build installs over it.
+          if [ -z "$KS" ]; then echo "::error::Secret DEBUG_KEYSTORE_B64 is not set"; exit 1; fi
+          mkdir -p ~/.android
+          echo "$KS" | base64 -d > ~/.android/debug.keystore
+      - name: Version
+        if: steps.skip.outputs.done != 'true'
+        run: |
+          G=frontend/android/app/build.gradle
+          CODE=$(grep -oP 'versionCode \K[0-9]+' "$G")
+          # Higher than the release it is built from, and rising on every run of that release.
+          NEW=$(( CODE * 100 + GITHUB_RUN_NUMBER % 100 ))
+          sed -i -E "s/versionCode [0-9]+/versionCode $NEW/; s/versionName \"[^\"]*\"/versionName \"${{ steps.src.outputs.ver }}\"/" "$G"
+          grep -E 'versionCode|versionName' "$G"
+      - name: Build the APK
+        if: steps.skip.outputs.done != 'true'
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:mobile
+          cd android && ./gradlew --no-daemon assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/openGym-${{ steps.src.outputs.ver }}.apk"
+
+      # ---------------------------------------------------------------- Release
+      - name: Publish the release
+        if: steps.skip.outputs.done != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REL="${{ steps.src.outputs.release }}"
+          gh release delete "$REL" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$REL" "openGym-${{ steps.src.outputs.ver }}.apk" -R "$GITHUB_REPOSITORY" \
+            --target fork-ci --latest \
+            --title "openGym ${{ steps.src.outputs.ver }}" \
+            --notes "openGym ${{ steps.src.outputs.tag }} + Cloudflare Access (branch \`$BRANCH\`).
+          API image: \`${{ steps.img.outputs.name }}:cf-access\` (also \`:${{ steps.src.outputs.ver }}\`)."
